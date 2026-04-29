@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(& \"C:\\\\Users\\\\kevin.crump\\\\source\\\\repos\\\\obsidianautomations\\\\setup-scheduled-task.ps1\")"
+    ]
+  }
+}
