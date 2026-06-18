@@ -1,7 +1,8 @@
 # Combined daily devlog generator for Obsidian.
-# Builds a "## Meetings" table (from Outlook) and a "## Tickets" table grouped by
-# sprint (current + next, from Jira). Both sections are created if missing and
-# refreshed in place if present; any other sections in the note are preserved.
+# Builds a "## Meetings" table (from the published Outlook calendar feed, via
+# get-meetings.js) and a "## Tickets" table grouped by sprint (current + next,
+# from Jira). Both sections are created if missing and refreshed in place if
+# present; any other sections in the note are preserved.
 
 $date = Get-Date -Format "yyyyMMdd"
 $monthFolder = Get-Date -Format "yyyyMM"
@@ -22,34 +23,22 @@ if (-not (Test-Path $monthDir)) {
 
 function Ensure-AppsRunning {
     param ($vaultName)
-    $launched = $false
-
-    # Outlook is required for the calendar read; launch it if it is not running.
-    if (-not (Get-Process -Name "OUTLOOK" -ErrorAction SilentlyContinue)) {
-        try { Start-Process "outlook.exe" -ErrorAction Stop; $launched = $true } catch {}
-    }
 
     # Obsidian: open the vault so the app is up before we write/show the note.
-    if (-not (Get-Process -Name "Obsidian" -ErrorAction SilentlyContinue)) {
-        try {
-            Start-Process ('obsidian://open?vault=' + [Uri]::EscapeDataString($vaultName))
-            $launched = $true
-        }
-        catch {}
+    # (Outlook is no longer needed; meetings come from the published calendar feed.)
+    if (Get-Process -Name "Obsidian" -ErrorAction SilentlyContinue) { return }
+    try {
+        Start-Process ('obsidian://open?vault=' + [Uri]::EscapeDataString($vaultName))
     }
+    catch { return }
 
-    # Wait for both processes to be present (up to ~40s).
+    # Wait for the process to appear (up to ~40s), then let the vault finish loading.
     $deadline = (Get-Date).AddSeconds(40)
     while ((Get-Date) -lt $deadline) {
-        $olUp = $null -ne (Get-Process -Name "OUTLOOK" -ErrorAction SilentlyContinue)
-        $obUp = $null -ne (Get-Process -Name "Obsidian" -ErrorAction SilentlyContinue)
-        if ($olUp -and $obUp) { break }
+        if (Get-Process -Name "Obsidian" -ErrorAction SilentlyContinue) { break }
         Start-Sleep -Seconds 2
     }
-
-    # If we just launched something, give it time to finish initializing
-    # (Outlook MAPI profile / Obsidian vault load) before reading the calendar.
-    if ($launched) { Start-Sleep -Seconds 15 }
+    Start-Sleep -Seconds 10
 }
 
 function Finalize-Cell {
@@ -130,37 +119,64 @@ function Clean-Summary {
     return ($parts -join " - ")
 }
 
+function Resolve-NodeExe {
+    # Node is provided per-user by fnm (kevin.crump is a standard, non-admin user,
+    # so there is no system-wide Node on PATH). In an interactive dev shell fnm's
+    # shell-integration puts node on PATH; in this non-interactive scheduled task
+    # it does NOT, so fall back to fnm's default-version junction (a stable path
+    # that always tracks `fnm default`).
+    $cmd = Get-Command node -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $fnmDefault = Join-Path $env:APPDATA "fnm\aliases\default\node.exe"
+    if (Test-Path $fnmDefault) { return $fnmDefault }
+
+    # Last resort: the newest installed fnm Node version.
+    $versions = Join-Path $env:APPDATA "fnm\node-versions"
+    if (Test-Path $versions) {
+        $node = Get-ChildItem $versions -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName "installation\node.exe" } |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+        if ($node) { return $node }
+    }
+    return $null
+}
+
 function Get-TodayMeetings {
-    $wasRunning = $null -ne (Get-Process -Name "OUTLOOK" -ErrorAction SilentlyContinue)
+    # Cloud fetch: get-meetings.js pulls the published Outlook ICS feed (URL in
+    # the OUTLOOK_ICS_URL user env var), expands recurring events, and prints
+    # today's non-all-day meetings as JSON. No Outlook desktop dependency.
+    $icsUrl = $env:OUTLOOK_ICS_URL
+    if ([string]::IsNullOrWhiteSpace($icsUrl)) {
+        $icsUrl = [System.Environment]::GetEnvironmentVariable("OUTLOOK_ICS_URL", "User")
+    }
+    if ([string]::IsNullOrWhiteSpace($icsUrl)) {
+        return [PSCustomObject]@{ Ok = $false; Meetings = @() }
+    }
+
     try {
-        $ol = New-Object -ComObject Outlook.Application -ErrorAction Stop
-        $ns = $ol.GetNamespace("MAPI")
-        if (-not $wasRunning) { Start-Sleep -Seconds 10 }
-
-        $calendar = $ns.GetDefaultFolder(9)
-        $items = $calendar.Items
-        $items.IncludeRecurrences = $true
-        $items.Sort("[Start]")
-
-        $today = [DateTime]::Today
-        $tomorrow = $today.AddDays(1)
-        $startStr = $today.ToString("MM/dd/yyyy") + " 12:00 AM"
-        $endStr = $tomorrow.ToString("MM/dd/yyyy") + " 12:00 AM"
-        $filter = "[Start] >= '" + $startStr + "' AND [Start] < '" + $endStr + "' AND [AllDayEvent] = False"
-        $filtered = $items.Restrict($filter)
+        $env:OUTLOOK_ICS_URL = $icsUrl
+        $helper = Join-Path $PSScriptRoot "get-meetings.js"
+        $nodeExe = Resolve-NodeExe
+        if (-not $nodeExe) {
+            return [PSCustomObject]@{ Ok = $false; Meetings = @() }
+        }
+        $json = & $nodeExe $helper
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace("$json")) {
+            return [PSCustomObject]@{ Ok = $false; Meetings = @() }
+        }
 
         $meetings = @()
-        foreach ($m in $filtered) {
-            $owner = ""
-            try { $owner = $m.Organizer } catch {}
-            $location = ""
-            try { $location = $m.Location } catch {}
-            $summary = ""
-            try { $summary = Clean-Summary $m.Body $location } catch {}
+        foreach ($e in ("$json" | ConvertFrom-Json)) {
+            $start = [DateTimeOffset]::Parse($e.start).LocalDateTime
+            $end = [DateTimeOffset]::Parse($e.end).LocalDateTime
+            $summary = Clean-Summary $e.description $e.location
             $meetings += [PSCustomObject]@{
-                Time    = $m.Start.ToString("h:mm tt") + " - " + $m.End.ToString("h:mm tt")
-                Subject = $m.Subject
-                Owner   = $owner
+                Time    = $start.ToString("h:mm tt") + " - " + $end.ToString("h:mm tt")
+                Subject = $e.subject
+                Owner   = $e.organizer
                 Summary = $summary
             }
         }
@@ -321,8 +337,33 @@ function Ensure-Header {
     $note.Preamble = $new
 }
 
+function Get-HandWrittenRemainder {
+    param ($bodyLines)
+    # A managed section (Meetings/Tickets) holds an auto-generated block at the
+    # top: optional blanks, a markdown pipe table (or a "_No ..._" placeholder),
+    # then blanks. Strip exactly that leading block and return whatever the user
+    # hand-wrote after it, so a refresh rewrites the table but keeps their notes.
+    $list = @($bodyLines)
+    $i = 0
+    while ($i -lt $list.Count -and [string]::IsNullOrWhiteSpace($list[$i])) { $i++ }
+    while ($i -lt $list.Count -and ($list[$i] -match '^\s*\|' -or $list[$i] -match '^\s*_No .*_\s*$')) { $i++ }
+    while ($i -lt $list.Count -and [string]::IsNullOrWhiteSpace($list[$i])) { $i++ }
+    if ($i -ge $list.Count) { return @() }
+    return @($list[$i..($list.Count - 1)])
+}
+
+function Append-HandNotes {
+    param ($body, $handNotes)
+    if ($handNotes.Count -gt 0) {
+        foreach ($l in $handNotes) { [void]$body.Add($l) }
+        while ($body.Count -gt 0 -and [string]::IsNullOrWhiteSpace($body[$body.Count - 1])) { $body.RemoveAt($body.Count - 1) }
+        [void]$body.Add("")
+    }
+}
+
 function Set-MeetingsBody {
     param ($section, $meetings)
+    $hand = Get-HandWrittenRemainder $section.Body
     $body = New-Object System.Collections.ArrayList
     [void]$body.Add("")
     if ($meetings.Count -gt 0) {
@@ -334,16 +375,19 @@ function Set-MeetingsBody {
         [void]$body.Add("_No meetings scheduled_")
     }
     [void]$body.Add("")
+    Append-HandNotes $body $hand
     $section.Body = $body
 }
 
 function Set-TicketsBody {
     param ($section, $tickets)
+    $hand = Get-HandWrittenRemainder $section.Body
     $body = New-Object System.Collections.ArrayList
     [void]$body.Add("")
     if ($tickets.Count -eq 0) {
         [void]$body.Add("_No tickets assigned in current or next sprint_")
         [void]$body.Add("")
+        Append-HandNotes $body $hand
         $section.Body = $body
         return
     }
@@ -368,12 +412,13 @@ function Set-TicketsBody {
     }
 
     [void]$body.Add("")
+    Append-HandNotes $body $hand
     $section.Body = $body
 }
 
 # ---------------- Main ----------------
 
-# Open Outlook + Obsidian (if needed) and wait for them before doing the work.
+# Open Obsidian (if needed) and wait for it before doing the work.
 Ensure-AppsRunning $vaultName
 
 if (Test-Path $filePath) {

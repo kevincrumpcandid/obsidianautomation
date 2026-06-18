@@ -1,0 +1,8 @@
+{
+  "name": "obsidianautomations",
+  "private": true,
+  "description": "Node helper for the Obsidian daily devlog: fetches today's meetings from the published Outlook ICS feed.",
+  "dependencies": {
+    "ical-expander": "^3.1.0"
+  }
+}
