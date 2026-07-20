@@ -1,5 +1,10 @@
 # Phase 2: Microsoft Graph API Calendar Integration
 
+> **Superseded (2026-06-10):** the Outlook COM dependency was removed by switching to a
+> published calendar ICS feed (`OUTLOOK_ICS_URL` env var + `get-meetings.js`), which needs
+> no Graph permissions at all. This document is kept as the fallback plan in case the
+> tenant ever disables calendar publishing.
+
 Replace the Outlook COM approach in `create-devlog.ps1` with direct Graph API calls.
 This removes the dependency on Outlook being installed or running.
 

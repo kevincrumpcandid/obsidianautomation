@@ -9,7 +9,7 @@ with today's Outlook calendar meetings pre-populated.
 
 The script runs at 7 AM daily and again on each logon:
 1. Creates `devlog YYYYMMDD.md` in a `devlog` subfolder of your vault (skips if it already exists)
-2. Fetches today's meetings from Outlook and appends a `## Meetings` section (skipped if already present, so running twice is safe)
+2. Fetches today's meetings from your published Outlook calendar feed (cloud — no Outlook desktop needed) and appends a `## Meetings` section (refreshed in place, so running twice is safe)
 3. Opens the note in Obsidian
 
 ---
@@ -18,12 +18,31 @@ The script runs at 7 AM daily and again on each logon:
 
 - Windows 10 or 11
 - Obsidian installed and configured with a vault
-- Microsoft Outlook desktop installed (used for calendar data via COM)
+- Node.js (used by `get-meetings.js` to fetch and expand the calendar feed)
+- A published Outlook calendar ICS URL (see below)
 - Obsidian set to **open on startup** (Settings -> About -> "Open Obsidian on system startup")
 
-Outlook does not need to be open when the task fires — the script will launch it silently
-and wait 10 seconds for it to sync before querying the calendar. For best results, Outlook
-should already be running when you log in each morning.
+### Publishing your calendar
+
+1. Go to [outlook.office.com](https://outlook.office.com) -> Settings -> **Calendar** -> **Shared calendars**
+2. Under **Publish a calendar**, select your calendar, set the permission to
+   **"Can view all details"** (lesser levels only show "Busy" with no subjects), and click **Publish**
+3. Copy the **ICS** link and store it as a user environment variable (it is a secret —
+   anyone with the URL can read your calendar; never commit it):
+
+```powershell
+[Environment]::SetEnvironmentVariable("OUTLOOK_ICS_URL", "https://outlook.office365.com/owa/calendar/.../calendar.ics", "User")
+```
+
+Then install the Node dependency once, from the repo folder:
+
+```powershell
+npm install
+```
+
+Note: the published feed can lag calendar changes by a few minutes, which is fine for a
+morning snapshot. If your tenant has calendar publishing disabled, see `PHASE2_GRAPH_API.md`
+for the Graph API alternative.
 
 ---
 
@@ -51,86 +70,17 @@ Open `%APPDATA%\obsidian\obsidian.json` in a text editor. You will see something
 
 Note the `path` value and your vault's display name (the last folder in the path).
 
-### Step 2 — Create the devlog script
+### Step 2 — Get the devlog script
 
-Create `create-devlog.ps1` anywhere permanent (e.g. `C:\Users\you\scripts\`):
+Clone this repo (or copy `create-devlog.ps1`, `get-meetings.js`, and `package.json`
+to a permanent folder — they must stay together), then run `npm install` in that folder.
 
-```powershell
-$date = Get-Date -Format "yyyyMMdd"
-$displayDate = Get-Date -Format "yyyy-MM-dd"
-$vaultPath = "C:\Users\you\Documents\My Vault"
-$devlogDir = Join-Path $vaultPath "devlog"
-$fileName = "devlog $date.md"
-$filePath = Join-Path $devlogDir $fileName
+In `create-devlog.ps1`, replace:
+- the `$vaultPath` value with your actual vault path
+- `Dev%20Docs` in the Obsidian URI at the bottom with your vault name (spaces as `%20`)
+- `devlog` with your preferred subfolder name
 
-if (-not (Test-Path $devlogDir)) {
-    New-Item -ItemType Directory -Path $devlogDir | Out-Null
-}
-
-if (-not (Test-Path $filePath)) {
-    Set-Content -Path $filePath -Value "# Devlog - $displayDate`n`n" -Encoding UTF8
-}
-
-function Get-TodayMeetings {
-    $wasRunning = $null -ne (Get-Process -Name "OUTLOOK" -ErrorAction SilentlyContinue)
-
-    try {
-        $ol = New-Object -ComObject Outlook.Application -ErrorAction Stop
-        $ns = $ol.GetNamespace("MAPI")
-
-        if (-not $wasRunning) {
-            Start-Sleep -Seconds 10
-        }
-
-        $calendar = $ns.GetDefaultFolder(9)
-        $items = $calendar.Items
-        $items.IncludeRecurrences = $true
-        $items.Sort("[Start]")
-
-        $today = [DateTime]::Today
-        $tomorrow = $today.AddDays(1)
-        $startStr = $today.ToString("MM/dd/yyyy") + " 12:00 AM"
-        $endStr = $tomorrow.ToString("MM/dd/yyyy") + " 12:00 AM"
-        $filter = "[Start] >= '" + $startStr + "' AND [Start] < '" + $endStr + "' AND [AllDayEvent] = False"
-        $filtered = $items.Restrict($filter)
-
-        $lines = @()
-        foreach ($m in $filtered) {
-            $start = $m.Start.ToString("h:mm tt")
-            $end = $m.End.ToString("h:mm tt")
-            $lines += "- " + $start + " - " + $end + "  " + $m.Subject
-        }
-        return $lines
-    }
-    catch {
-        return $null
-    }
-}
-
-$existing = Get-Content -Path $filePath -Raw -Encoding UTF8
-if ($existing -notmatch "## Meetings") {
-    $meetings = Get-TodayMeetings
-    if ($null -ne $meetings) {
-        $section = "`n## Meetings`n`n"
-        if ($meetings.Count -gt 0) {
-            $section += ($meetings -join "`n") + "`n"
-        }
-        else {
-            $section += "_No meetings scheduled_`n"
-        }
-        Add-Content -Path $filePath -Value $section -Encoding UTF8
-    }
-}
-
-$encodedFile = [Uri]::EscapeDataString("devlog/devlog $date")
-$uri = 'obsidian://open?vault=My%20Vault&file=' + $encodedFile
-Start-Process $uri
-```
-
-Replace:
-- `C:\Users\you\Documents\My Vault` with your actual vault path
-- `My%20Vault` in the URI with your vault name (spaces as `%20`)
-- `devlog` with your preferred subfolder name (same value in both places)
+Set the `OUTLOOK_ICS_URL` environment variable as described in Prerequisites.
 
 > **Important:** Use only plain ASCII characters in `.ps1` files. Special characters
 > like em dashes cause PowerShell 5.1 encoding errors on unrelated lines.
@@ -183,7 +133,9 @@ Unregister-ScheduledTask -TaskName "Obsidian Daily Devlog" -Confirm:$false
 
 ---
 
-## Roadmap
+## History
 
-See `PHASE2_GRAPH_API.md` for planned migration from Outlook COM to Microsoft Graph API,
-which will remove the Outlook desktop dependency.
+Meetings originally came from Outlook desktop via COM; as of 2026-06-10 they come from
+the published calendar ICS feed instead, removing the Outlook desktop dependency.
+`PHASE2_GRAPH_API.md` documents the Graph API alternative if calendar publishing is
+ever disabled by the tenant.

@@ -17,8 +17,32 @@ $filePath = Join-Path $monthDir $fileName
 $jiraBase = "https://candidprojects.atlassian.net"
 $jiraEmail = "kevin.crump@candid.org"
 
+# Per-user log location (no admin needed). A rolling devlog.log holds one line per
+# event; a per-run transcript captures full output. Both are pruned after 30 days.
+$logDir = Join-Path $env:LOCALAPPDATA "obsidian-devlog\logs"
+$script:logFile = $null
+
 if (-not (Test-Path $monthDir)) {
     New-Item -ItemType Directory -Path $monthDir -Force | Out-Null
+}
+
+function Write-Log {
+    param([string] $Message, [string] $Level = "INFO")
+    if (-not $script:logFile) { return }
+    try {
+        $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        Add-Content -Path $script:logFile -Value "[$ts] [$Level] $Message" -Encoding UTF8
+    }
+    catch { }
+}
+
+function New-Banner {
+    # Obsidian callout shown in the note when a section genuinely failed to load
+    # (as opposed to a real empty day). Kept plain ASCII for PS 5.1.
+    param([string] $What, [string] $Reason)
+    $r = $Reason
+    if ([string]::IsNullOrWhiteSpace($r)) { $r = "unknown error" }
+    return "> [!warning] $What unavailable - $r (see log)"
 }
 
 function Ensure-AppsRunning {
@@ -144,6 +168,49 @@ function Resolve-NodeExe {
     return $null
 }
 
+function Wait-ForNetwork {
+    # Logon/startup runs can fire before DNS/network is ready, so the fetches
+    # below fail silently and the note is written with no Meetings/Tickets. Poll
+    # until every host we depend on resolves, up to a bounded timeout; if it
+    # never comes up we fall through and the fetches degrade as before.
+    param(
+        [string[]] $Hosts,
+        [int] $TimeoutSeconds = 180,
+        [int] $IntervalSeconds = 10
+    )
+    $targets = @($Hosts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    if ($targets.Count -eq 0) { return $true }
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $allOk = $true
+        foreach ($h in $targets) {
+            try { [void][System.Net.Dns]::GetHostAddresses($h) }
+            catch { $allOk = $false; break }
+        }
+        if ($allOk) { return $true }
+        if ((Get-Date) -ge $deadline) { return $false }
+        Start-Sleep -Seconds $IntervalSeconds
+    }
+}
+
+function Invoke-WithRetry {
+    # Retry a flaky network operation a few times before giving up. The action
+    # must throw on failure (use -ErrorAction Stop / throw); its return value is
+    # passed straight back on success.
+    param(
+        [scriptblock] $Action,
+        [int] $MaxAttempts = 3,
+        [int] $DelaySeconds = 5
+    )
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try { return (& $Action) }
+        catch {
+            if ($attempt -ge $MaxAttempts) { throw }
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+}
+
 function Get-TodayMeetings {
     # Cloud fetch: get-meetings.js pulls the published Outlook ICS feed (URL in
     # the OUTLOOK_ICS_URL user env var), expands recurring events, and prints
@@ -153,7 +220,8 @@ function Get-TodayMeetings {
         $icsUrl = [System.Environment]::GetEnvironmentVariable("OUTLOOK_ICS_URL", "User")
     }
     if ([string]::IsNullOrWhiteSpace($icsUrl)) {
-        return [PSCustomObject]@{ Ok = $false; Meetings = @() }
+        Write-Log "Meetings skipped: OUTLOOK_ICS_URL not set" "WARN"
+        return [PSCustomObject]@{ Ok = $false; Meetings = @(); Reason = "OUTLOOK_ICS_URL not set" }
     }
 
     try {
@@ -161,11 +229,22 @@ function Get-TodayMeetings {
         $helper = Join-Path $PSScriptRoot "get-meetings.js"
         $nodeExe = Resolve-NodeExe
         if (-not $nodeExe) {
-            return [PSCustomObject]@{ Ok = $false; Meetings = @() }
+            Write-Log "Meetings failed: Node not found (fnm default junction missing)" "ERROR"
+            return [PSCustomObject]@{ Ok = $false; Meetings = @(); Reason = "Node not found" }
         }
-        $json = & $nodeExe $helper
-        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace("$json")) {
-            return [PSCustomObject]@{ Ok = $false; Meetings = @() }
+        Write-Log "Using node: $nodeExe"
+        # Keep stdout (the JSON) clean; send stderr to a file so Node's fetch
+        # ExperimentalWarning can't corrupt the JSON, while still capturing the
+        # real error text for the log on failure.
+        $errPath = Join-Path $logDir "get-meetings.err.txt"
+        $json = Invoke-WithRetry -Action {
+            $out = & $nodeExe $helper 2>$errPath
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace("$out")) {
+                $errText = ""
+                if (Test-Path $errPath) { $errText = (Get-Content $errPath -Raw -ErrorAction SilentlyContinue) }
+                throw "get-meetings.js failed (exit $LASTEXITCODE): $errText"
+            }
+            return $out
         }
 
         $meetings = @()
@@ -180,10 +259,12 @@ function Get-TodayMeetings {
                 Summary = $summary
             }
         }
-        return [PSCustomObject]@{ Ok = $true; Meetings = $meetings }
+        Write-Log "Meetings loaded: $($meetings.Count) event(s)"
+        return [PSCustomObject]@{ Ok = $true; Meetings = $meetings; Reason = "" }
     }
     catch {
-        return [PSCustomObject]@{ Ok = $false; Meetings = @() }
+        Write-Log "Meetings failed: $($_.Exception.Message)" "ERROR"
+        return [PSCustomObject]@{ Ok = $false; Meetings = @(); Reason = "fetch error" }
     }
 }
 
@@ -195,7 +276,8 @@ function Get-JiraTickets {
         $token = [System.Environment]::GetEnvironmentVariable("JIRA_API_TOKEN", "User")
     }
     if ([string]::IsNullOrWhiteSpace($token)) {
-        return [PSCustomObject]@{ Ok = $false; Tickets = @() }
+        Write-Log "Tickets skipped: JIRA_API_TOKEN not set" "WARN"
+        return [PSCustomObject]@{ Ok = $false; Tickets = @(); Reason = "JIRA_API_TOKEN not set" }
     }
 
     try {
@@ -208,7 +290,11 @@ function Get-JiraTickets {
         # customfield_12108 = "Story point estimate"; customfield_10006 = "Sprint".
         $url = $jiraBase + '/rest/api/3/search/jql?jql=' + [Uri]::EscapeDataString($jql) + '&fields=summary,status,customfield_12108,customfield_10006&maxResults=50'
 
-        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ContentType "application/json" -ErrorAction Stop
+        # Retry + bounded timeout: the call previously had neither, so a slow or
+        # transient Jira response could hang past the task limit or fail outright.
+        $resp = Invoke-WithRetry -Action {
+            Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ContentType "application/json" -TimeoutSec 30 -ErrorAction Stop
+        }
 
         $out = @()
         foreach ($i in $resp.issues) {
@@ -250,10 +336,12 @@ function Get-JiraTickets {
                 SprintStart = $sprintStart
             }
         }
-        return [PSCustomObject]@{ Ok = $true; Tickets = $out }
+        Write-Log "Tickets loaded: $($out.Count) issue(s)"
+        return [PSCustomObject]@{ Ok = $true; Tickets = $out; Reason = "" }
     }
     catch {
-        return [PSCustomObject]@{ Ok = $false; Tickets = @() }
+        Write-Log "Tickets failed: $($_.Exception.Message)" "ERROR"
+        return [PSCustomObject]@{ Ok = $false; Tickets = @(); Reason = "Jira request failed" }
     }
 }
 
@@ -340,16 +428,35 @@ function Ensure-Header {
 function Get-HandWrittenRemainder {
     param ($bodyLines)
     # A managed section (Meetings/Tickets) holds an auto-generated block at the
-    # top: optional blanks, a markdown pipe table (or a "_No ..._" placeholder),
-    # then blanks. Strip exactly that leading block and return whatever the user
-    # hand-wrote after it, so a refresh rewrites the table but keeps their notes.
+    # top: optional blanks, an optional "> [!warning] ... unavailable" banner, a
+    # markdown pipe table (or a "_No ..._" placeholder), then blanks. Strip exactly
+    # that leading block and return whatever the user hand-wrote after it, so a
+    # refresh rewrites the table but keeps their notes. The banner match is narrow
+    # ("[!warning] ... unavailable") so it never eats a user's own blockquote.
     $list = @($bodyLines)
     $i = 0
+    while ($i -lt $list.Count -and [string]::IsNullOrWhiteSpace($list[$i])) { $i++ }
+    while ($i -lt $list.Count -and $list[$i] -match '^\s*>\s*\[!(warning|failure|error)\].*unavailable') { $i++ }
     while ($i -lt $list.Count -and [string]::IsNullOrWhiteSpace($list[$i])) { $i++ }
     while ($i -lt $list.Count -and ($list[$i] -match '^\s*\|' -or $list[$i] -match '^\s*_No .*_\s*$')) { $i++ }
     while ($i -lt $list.Count -and [string]::IsNullOrWhiteSpace($list[$i])) { $i++ }
     if ($i -ge $list.Count) { return @() }
     return @($list[$i..($list.Count - 1)])
+}
+
+function Get-LastTable {
+    param ($bodyLines)
+    # Pull the existing pipe-table rows out of a managed section's auto block, so a
+    # later failed refresh can preserve the last good table instead of blanking it.
+    # Only real "| ... |" lines are kept (a "_No ..._" placeholder is not a table).
+    $list = @($bodyLines)
+    $i = 0
+    while ($i -lt $list.Count -and [string]::IsNullOrWhiteSpace($list[$i])) { $i++ }
+    while ($i -lt $list.Count -and $list[$i] -match '^\s*>\s*\[!(warning|failure|error)\].*unavailable') { $i++ }
+    while ($i -lt $list.Count -and [string]::IsNullOrWhiteSpace($list[$i])) { $i++ }
+    $rows = New-Object System.Collections.ArrayList
+    while ($i -lt $list.Count -and $list[$i] -match '^\s*\|') { [void]$rows.Add($list[$i]); $i++ }
+    return @($rows.ToArray())
 }
 
 function Append-HandNotes {
@@ -362,14 +469,24 @@ function Append-HandNotes {
 }
 
 function Set-MeetingsBody {
-    param ($section, $meetings)
+    param ($section, $result)
     $hand = Get-HandWrittenRemainder $section.Body
     $body = New-Object System.Collections.ArrayList
     [void]$body.Add("")
-    if ($meetings.Count -gt 0) {
+    if (-not $result.Ok) {
+        # Genuine failure: show a visible banner instead of silence, and keep the
+        # last good table if a prior run in this note had one.
+        [void]$body.Add((New-Banner "Meetings" $result.Reason))
+        $prior = Get-LastTable $section.Body
+        if ($prior.Count -gt 0) {
+            [void]$body.Add("")
+            foreach ($l in $prior) { [void]$body.Add($l) }
+        }
+    }
+    elseif ($result.Meetings.Count -gt 0) {
         [void]$body.Add("| Time | Meeting | Owner | Summary |")
         [void]$body.Add("| --- | --- | --- | --- |")
-        foreach ($m in $meetings) { [void]$body.Add((Format-MeetingRow $m)) }
+        foreach ($m in $result.Meetings) { [void]$body.Add((Format-MeetingRow $m)) }
     }
     else {
         [void]$body.Add("_No meetings scheduled_")
@@ -380,10 +497,24 @@ function Set-MeetingsBody {
 }
 
 function Set-TicketsBody {
-    param ($section, $tickets)
+    param ($section, $result)
     $hand = Get-HandWrittenRemainder $section.Body
     $body = New-Object System.Collections.ArrayList
     [void]$body.Add("")
+    if (-not $result.Ok) {
+        [void]$body.Add((New-Banner "Tickets" $result.Reason))
+        $prior = Get-LastTable $section.Body
+        if ($prior.Count -gt 0) {
+            [void]$body.Add("")
+            foreach ($l in $prior) { [void]$body.Add($l) }
+        }
+        [void]$body.Add("")
+        Append-HandNotes $body $hand
+        $section.Body = $body
+        return
+    }
+
+    $tickets = $result.Tickets
     if ($tickets.Count -eq 0) {
         [void]$body.Add("_No tickets assigned in current or next sprint_")
         [void]$body.Add("")
@@ -416,60 +547,179 @@ function Set-TicketsBody {
     $section.Body = $body
 }
 
+function Get-OngoingBody {
+    # Live mirror: copy the body of the hand-edited ONGOING note (vault root)
+    # into the daily note's "## Ongoing" section, refreshed every run.
+    $ongoingPath = Join-Path $vaultPath "ONGOING.md"
+    if (-not (Test-Path $ongoingPath)) {
+        return [PSCustomObject]@{ Ok = $false; Lines = @() }
+    }
+    try {
+        $raw = Get-Content -Path $ongoingPath -Encoding UTF8
+        if ($null -eq $raw) { $raw = @() }
+        $lines = @($raw)
+
+        # Demote any top-level (# / ##) headings in the source to h3+ so the
+        # copied content never introduces new sections into the daily note (that
+        # would break the in-place refresh and leave orphan sections behind).
+        $lines = @(foreach ($l in $lines) {
+            if ($l -match '^(#{1,2})(\s.*)$') { '###' + $matches[2] } else { $l }
+        })
+
+        # Trim leading/trailing blank lines.
+        $start = 0
+        while ($start -lt $lines.Count -and [string]::IsNullOrWhiteSpace($lines[$start])) { $start++ }
+        $end = $lines.Count - 1
+        while ($end -ge $start -and [string]::IsNullOrWhiteSpace($lines[$end])) { $end-- }
+        if ($start -gt $end) { return [PSCustomObject]@{ Ok = $true; Lines = @() } }
+        return [PSCustomObject]@{ Ok = $true; Lines = @($lines[$start..$end]) }
+    }
+    catch {
+        return [PSCustomObject]@{ Ok = $false; Lines = @() }
+    }
+}
+
+function Set-OngoingBody {
+    param ($section, $ongoingLines)
+    # Full mirror of the source note (user opted for overwrite-each-run). Only
+    # ever rewrites the "## Ongoing" section; other sections stay untouched.
+    $body = New-Object System.Collections.ArrayList
+    [void]$body.Add("")
+    if ($ongoingLines.Count -gt 0) {
+        foreach ($l in $ongoingLines) { [void]$body.Add($l) }
+    }
+    else {
+        [void]$body.Add("_ONGOING note is empty_")
+    }
+    [void]$body.Add("")
+    $section.Body = $body
+}
+
 # ---------------- Main ----------------
 
-# Open Obsidian (if needed) and wait for it before doing the work.
-Ensure-AppsRunning $vaultName
-
-if (Test-Path $filePath) {
-    $lines = Get-Content -Path $filePath -Encoding UTF8
-    if ($null -eq $lines) { $lines = @() }
+# --- Logging: per-run transcript + a rolling one-line-per-event devlog.log, both
+# under %LOCALAPPDATA% (no admin). Prune transcripts after 30 days; cap devlog.log
+# at ~1 MB (keep one .1 backup). Best-effort: logging must never break the run.
+try {
+    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+    $script:logFile = Join-Path $logDir "devlog.log"
+    if ((Test-Path $script:logFile) -and ((Get-Item $script:logFile).Length -gt 1MB)) {
+        Move-Item -Path $script:logFile -Destination (Join-Path $logDir "devlog.log.1") -Force -ErrorAction SilentlyContinue
+    }
+    $stamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
+    Start-Transcript -Path (Join-Path $logDir "transcript-$stamp.log") -Force | Out-Null
+    Get-ChildItem -Path $logDir -Filter "transcript-*.log" -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
 }
-else {
-    $lines = @($titleText, "")
-}
+catch { }
 
-$note = Parse-Note $lines
-Ensure-Header $note $titleText
+Write-Log "=== Run start (user=$env:USERNAME, note=$fileName) ==="
 
-# Meetings: create or refresh
-$meetings = Get-TodayMeetings
-if ($meetings.Ok) {
+try {
+    # Wait for DNS to come up before the network fetches. Logon/wake runs can fire
+    # before the network is ready; without this the fetches throw and the sections
+    # come up empty. Safe now that the task ExecutionTimeLimit is 10 min.
+    $netHosts = New-Object System.Collections.ArrayList
+    try { [void]$netHosts.Add(([Uri]$jiraBase).Host) } catch { }
+    $icsForHost = $env:OUTLOOK_ICS_URL
+    if ([string]::IsNullOrWhiteSpace($icsForHost)) {
+        $icsForHost = [System.Environment]::GetEnvironmentVariable("OUTLOOK_ICS_URL", "User")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($icsForHost)) {
+        try { [void]$netHosts.Add(([Uri]$icsForHost).Host) } catch { }
+    }
+    if ((Wait-ForNetwork -Hosts $netHosts.ToArray() -TimeoutSeconds 180)) {
+        Write-Log "Network ready (hosts: $($netHosts -join ', '))"
+    }
+    else {
+        Write-Log "Network wait timed out; proceeding (fetches may degrade)" "WARN"
+    }
+
+    # Open Obsidian (if needed) and wait for it before doing the work.
+    Ensure-AppsRunning $vaultName
+
+    if (Test-Path $filePath) {
+        $lines = Get-Content -Path $filePath -Encoding UTF8
+        if ($null -eq $lines) { $lines = @() }
+    }
+    else {
+        $lines = @($titleText, "")
+    }
+
+    $note = Parse-Note $lines
+    Ensure-Header $note $titleText
+
+    # Meetings: always ensure the section exists, then render the table on success
+    # or a "> [!warning] ... unavailable" banner on failure (never silently absent).
+    $meetings = Get-TodayMeetings
     $meetingsSection = Find-Section $note '^##\s+Meetings'
     if ($null -eq $meetingsSection) {
         $meetingsSection = @{ Heading = "## Meetings"; Body = (New-Object System.Collections.ArrayList) }
-        Set-MeetingsBody $meetingsSection $meetings.Meetings
         $note.Sections.Insert(0, $meetingsSection)
     }
-    else {
-        Set-MeetingsBody $meetingsSection $meetings.Meetings
-    }
-}
+    Set-MeetingsBody $meetingsSection $meetings
 
-# Tickets: create or refresh (only when the Jira call succeeded)
-$jira = Get-JiraTickets
-if ($jira.Ok) {
+    # Tickets: same contract as Meetings, placed right after it.
+    $jira = Get-JiraTickets
     $ticketsSection = Find-Section $note '^##\s+(Current\s+)?Tickets'
     if ($null -eq $ticketsSection) {
         $ticketsSection = @{ Heading = "## Tickets"; Body = (New-Object System.Collections.ArrayList) }
-        Set-TicketsBody $ticketsSection $jira.Tickets
         $insertAt = $note.Sections.Count
-        $meetingsSection = Find-Section $note '^##\s+Meetings'
-        if ($null -ne $meetingsSection) {
-            $insertAt = $note.Sections.IndexOf($meetingsSection) + 1
-        }
+        $ms = Find-Section $note '^##\s+Meetings'
+        if ($null -ne $ms) { $insertAt = $note.Sections.IndexOf($ms) + 1 }
         $note.Sections.Insert($insertAt, $ticketsSection)
     }
     else {
         $ticketsSection.Heading = "## Tickets"   # migrate legacy "## Current Tickets"
-        Set-TicketsBody $ticketsSection $jira.Tickets
     }
+    Set-TicketsBody $ticketsSection $jira
+
+    # Ongoing: live mirror of the hand-edited ONGOING note, refreshed only when it
+    # exists. Placed beneath Meetings and Tickets. Never touches other sections.
+    $ongoing = Get-OngoingBody
+    if ($ongoing.Ok) {
+        $ongoingSection = Find-Section $note '^##\s+Ongoing'
+        if ($null -eq $ongoingSection) {
+            $ongoingSection = @{ Heading = "## Ongoing"; Body = (New-Object System.Collections.ArrayList) }
+            Set-OngoingBody $ongoingSection $ongoing.Lines
+            $insertAt = $note.Sections.Count
+            $ts = Find-Section $note '^##\s+(Current\s+)?Tickets'
+            $ms = Find-Section $note '^##\s+Meetings'
+            if ($null -ne $ts) {
+                $insertAt = $note.Sections.IndexOf($ts) + 1
+            }
+            elseif ($null -ne $ms) {
+                $insertAt = $note.Sections.IndexOf($ms) + 1
+            }
+            $note.Sections.Insert($insertAt, $ongoingSection)
+        }
+        else {
+            Set-OngoingBody $ongoingSection $ongoing.Lines
+        }
+    }
+    else {
+        Write-Log "Ongoing skipped (ONGOING.md missing or unreadable)"
+    }
+
+    # Write the note as UTF-8 WITHOUT a BOM (PS 5.1's Set-Content -Encoding UTF8
+    # emits a BOM). WriteAllLines uses the platform newline (CRLF), which the read
+    # path (Get-Content) handles fine.
+    $content = Rebuild-Note $note
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines($filePath, [string[]]$content, $utf8NoBom)
+    Write-Log "Note written: $filePath"
+
+    # Open today's note in Obsidian
+    $encodedFile = [Uri]::EscapeDataString("devlog/$monthFolder/devlog $date")
+    $uri = 'obsidian://open?vault=Dev%20Docs&file=' + $encodedFile
+    Start-Process $uri
+    Write-Log "=== Run OK ==="
 }
-
-$content = Rebuild-Note $note
-Set-Content -Path $filePath -Value $content -Encoding UTF8
-
-# Open today's note in Obsidian
-$encodedFile = [Uri]::EscapeDataString("devlog/$monthFolder/devlog $date")
-$uri = 'obsidian://open?vault=Dev%20Docs&file=' + $encodedFile
-Start-Process $uri
+catch {
+    Write-Log "Run failed: $($_.Exception.Message)" "ERROR"
+    throw
+}
+finally {
+    try { Stop-Transcript | Out-Null } catch { }
+}

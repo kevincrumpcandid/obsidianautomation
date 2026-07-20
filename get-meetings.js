@@ -47,7 +47,16 @@ function toRow(icalEvent, startDate, endDate) {
 }
 
 async function main() {
-    const res = await fetch(url);
+    // Bound the fetch so a hung connection can't stall the scheduled task; the
+    // PowerShell caller (Invoke-WithRetry) will retry on the non-zero exit.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    let res;
+    try {
+        res = await fetch(url, { signal: controller.signal });
+    } finally {
+        clearTimeout(timer);
+    }
     if (!res.ok) throw new Error('ICS fetch failed: HTTP ' + res.status);
     const ics = await res.text();
 

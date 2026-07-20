@@ -13,16 +13,17 @@ log compared to OneNote.
 A single scheduled task runs `create-devlog.ps1` daily at **7:00 AM** and again **at
 logon**. Each run:
 
-1. **Ensures the apps are up** — checks for Outlook and Obsidian; launches whichever
-   is not running and waits for them to initialize.
+1. **Waits for the network, then ensures Obsidian is up** — polls DNS until the Jira
+   and calendar hosts resolve (bounded), then launches Obsidian if it is not already
+   running. Meetings come from the cloud calendar feed, so Outlook desktop is not needed.
 2. **Locates/creates today's note** at `…\<vault>\devlog\<yyyyMM>\devlog <yyyyMMdd>.md`
    (a per-month folder, e.g. `devlog\202606\devlog 20260610.md`).
 3. **Writes a friendly title** — `# Wednesday, June 10, 2026` (rebuilt deterministically
    each run, so it self-heals duplicate/malformed headers).
-4. **`## Meetings` table** — `| Time | Meeting | Owner | Summary |` from the Outlook
-   calendar (via COM). The Summary shows the meeting location (Zoom/Teams URLs become
-   short clickable links like `[Zoom](…)`) and appends `Agenda: …` when the invite body
-   contains a genuine agenda (join-link boilerplate is stripped).
+4. **`## Meetings` table** — `| Time | Meeting | Owner | Summary |` from the published
+   Outlook calendar feed (via `get-meetings.js`). The Summary shows the meeting location
+   (Zoom/Teams URLs become short clickable links like `[Zoom](…)`) and appends `Agenda: …`
+   when the invite body contains a genuine agenda (join-link boilerplate is stripped).
 5. **`## Tickets` table** — `| Ticket | Summary | Status | Points |` from Jira, grouped
    under bold **sprint subsection rows** for the active sprint and the next (future)
    sprint, e.g. `**UMT Sprint 5 (active)**` / `**UMT Sprint 6 (next)**`.
@@ -31,6 +32,25 @@ logon**. Each run:
 Both managed sections are created if missing and refreshed in place if present; any
 other sections you add to the note by hand are preserved. Running multiple times a day
 is safe and idempotent.
+
+### Reliability & logging
+
+The run is designed to fail loudly, never silently:
+
+- **Network wait** — logon/wake runs poll DNS until the Jira and calendar hosts resolve
+  (up to 3 min) before fetching, so a not-yet-ready network no longer yields empty sections.
+- **Bounded, retried fetches** — the Jira call retries with a 30s timeout; the calendar
+  fetch is bounded by a 20s timeout in `get-meetings.js`.
+- **Failure banners** — if a section genuinely fails to load, the note shows a
+  `> [!warning] Meetings unavailable - <reason> (see log)` callout instead of quietly
+  omitting the section, and the **last good table is preserved** beneath it. A truly empty
+  day still shows `_No meetings scheduled_`.
+- **Logs** — every run writes to `%LOCALAPPDATA%\obsidian-devlog\logs`: a rolling
+  `devlog.log` (one line per event) plus a per-run `transcript-<timestamp>.log`. Both are
+  pruned after 30 days. Check these first when a section comes up empty.
+- **Scheduled task** — registered to run on battery, restart up to 3× on failure, and
+  with a 10-minute execution limit (the network wait + retries need headroom). The logon
+  trigger is delayed 2 minutes to let the network come up.
 
 ### Example output
 
@@ -60,7 +80,7 @@ is safe and idempotent.
 
 | File | Summary |
 | --- | --- |
-| `create-devlog.ps1` | **The script.** Combined meetings + Jira generator (everything in "What it does"). Self-contained: app-launch/wait, section-aware Markdown parser (`Parse-Note`/`Rebuild-Note`/`Find-Section`), `Ensure-Header`, `Get-TodayMeetings` (Outlook COM), `Get-JiraTickets` (Jira REST), table builders, `Clean-Summary`/`Shorten-Location` for meeting summaries. Edit the config block at the top (`$vaultPath`, `$vaultName`, `$jiraEmail`) for another machine/user. |
+| `create-devlog.ps1` | **The script.** Combined meetings + Jira generator (everything in "What it does"). Self-contained: app-launch/wait, section-aware Markdown parser (`Parse-Note`/`Rebuild-Note`/`Find-Section`), `Ensure-Header`, `Get-TodayMeetings` (published ICS via `get-meetings.js`), `Get-JiraTickets` (Jira REST), table builders, `Clean-Summary`/`Shorten-Location` for meeting summaries. Edit the config block at the top (`$vaultPath`, `$vaultName`, `$jiraEmail`) for another machine/user. |
 | `setup-scheduled-task.ps1` | Registers the **`Obsidian Daily Devlog`** scheduled task (daily 7:00 AM + at logon) pointing at `create-devlog.ps1` in this folder (`$PSScriptRoot`). Uses `-Force`, so re-running updates the task in place. This is the only task you need. |
 | `setup-jira-task.ps1` | **Legacy/superseded.** Used to register a separate `Obsidian Daily Jira Tickets` task (7:05 AM) for the standalone Jira script. That task has been unregistered now that `create-devlog.ps1` does both jobs. Kept for reference; do not run it. |
 | `create-devlog-jira.ps1` | **Legacy/superseded.** The original standalone Jira-tickets script before it was merged into `create-devlog.ps1`. No longer scheduled; safe to delete. |
