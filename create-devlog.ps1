@@ -547,32 +547,68 @@ function Set-TicketsBody {
     $section.Body = $body
 }
 
+function Normalize-OngoingLines {
+    param ($lines)
+    $arr = @($lines)
+    # Demote any top-level (# / ##) headings in the source to h3+ so the copied
+    # content never introduces new sections into the daily note (that would break
+    # the in-place refresh and leave orphan sections behind).
+    $arr = @(foreach ($l in $arr) {
+        if ($l -match '^(#{1,2})(\s.*)$') { '###' + $matches[2] } else { $l }
+    })
+    # Trim leading/trailing blank lines.
+    $start = 0
+    while ($start -lt $arr.Count -and [string]::IsNullOrWhiteSpace($arr[$start])) { $start++ }
+    $end = $arr.Count - 1
+    while ($end -ge $start -and [string]::IsNullOrWhiteSpace($arr[$end])) { $end-- }
+    if ($start -gt $end) { return @() }
+    return @($arr[$start..$end])
+}
+
 function Get-OngoingBody {
-    # Live mirror: copy the body of the hand-edited ONGOING note (vault root)
-    # into the daily note's "## Ongoing" section, refreshed every run.
-    $ongoingPath = Join-Path $vaultPath "ONGOING.md"
-    if (-not (Test-Path $ongoingPath)) {
-        return [PSCustomObject]@{ Ok = $false; Lines = @() }
-    }
+    # Carry the "## Ongoing" section forward from the most recent PRIOR devlog note
+    # (previous day, or the latest note before today). This lets the user maintain
+    # Ongoing directly inside the daily notes; combined with the seed-once rule in
+    # Main, deletions stick because we read the last note's final state and never
+    # re-copy a frozen snapshot. Falls back to the hand-edited vault-root
+    # ONGOING.md only when no prior devlog note exists (e.g. the very first note).
     try {
+        $prior = $null
+        if (Test-Path $devlogRoot) {
+            $prior = Get-ChildItem -Path $devlogRoot -Recurse -Filter "devlog *.md" -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    if ($_.BaseName -match '^devlog\s+(\d{8})$') {
+                        [PSCustomObject]@{ File = $_; Date = $matches[1] }
+                    }
+                } |
+                Where-Object { $_.Date -lt $date } |   # exclude today's note (and any future)
+                Sort-Object Date -Descending |
+                Select-Object -First 1
+        }
+
+        if ($prior) {
+            $raw = Get-Content -Path $prior.File.FullName -Encoding UTF8
+            if ($null -eq $raw) { $raw = @() }
+            $pnote = Parse-Note (@($raw))
+            $psec = Find-Section $pnote '^##\s+Ongoing'
+            if ($null -ne $psec) {
+                Write-Log "Ongoing source: prior note $($prior.File.Name)"
+                return [PSCustomObject]@{ Ok = $true; Lines = (Normalize-OngoingLines $psec.Body) }
+            }
+            # Prior note exists but has no Ongoing section: nothing to carry.
+            Write-Log "Ongoing source: prior note $($prior.File.Name) has no Ongoing section"
+            return [PSCustomObject]@{ Ok = $true; Lines = @() }
+        }
+
+        # Fallback: hand-edited root ONGOING.md (only when there is no prior note).
+        $ongoingPath = Join-Path $vaultPath "ONGOING.md"
+        if (-not (Test-Path $ongoingPath)) {
+            return [PSCustomObject]@{ Ok = $false; Lines = @() }
+        }
         $raw = Get-Content -Path $ongoingPath -Encoding UTF8
         if ($null -eq $raw) { $raw = @() }
-        $lines = @($raw)
-
-        # Demote any top-level (# / ##) headings in the source to h3+ so the
-        # copied content never introduces new sections into the daily note (that
-        # would break the in-place refresh and leave orphan sections behind).
-        $lines = @(foreach ($l in $lines) {
-            if ($l -match '^(#{1,2})(\s.*)$') { '###' + $matches[2] } else { $l }
-        })
-
-        # Trim leading/trailing blank lines.
-        $start = 0
-        while ($start -lt $lines.Count -and [string]::IsNullOrWhiteSpace($lines[$start])) { $start++ }
-        $end = $lines.Count - 1
-        while ($end -ge $start -and [string]::IsNullOrWhiteSpace($lines[$end])) { $end-- }
-        if ($start -gt $end) { return [PSCustomObject]@{ Ok = $true; Lines = @() } }
-        return [PSCustomObject]@{ Ok = $true; Lines = @($lines[$start..$end]) }
+        Write-Log "Ongoing source: fallback ONGOING.md (no prior devlog note)"
+        return [PSCustomObject]@{ Ok = $true; Lines = (Normalize-OngoingLines @($raw)) }
     }
     catch {
         return [PSCustomObject]@{ Ok = $false; Lines = @() }
@@ -581,8 +617,9 @@ function Get-OngoingBody {
 
 function Set-OngoingBody {
     param ($section, $ongoingLines)
-    # Full mirror of the source note (user opted for overwrite-each-run). Only
-    # ever rewrites the "## Ongoing" section; other sections stay untouched.
+    # Fill a NEWLY created "## Ongoing" section from the carried-forward source.
+    # Only called when the section did not already exist in today's note (see the
+    # seed-once rule in Main), so it never clobbers edits made during the day.
     $body = New-Object System.Collections.ArrayList
     [void]$body.Add("")
     if ($ongoingLines.Count -gt 0) {
@@ -675,12 +712,15 @@ try {
     }
     Set-TicketsBody $ticketsSection $jira
 
-    # Ongoing: live mirror of the hand-edited ONGOING note, refreshed only when it
-    # exists. Placed beneath Meetings and Tickets. Never touches other sections.
-    $ongoing = Get-OngoingBody
-    if ($ongoing.Ok) {
-        $ongoingSection = Find-Section $note '^##\s+Ongoing'
-        if ($null -eq $ongoingSection) {
+    # Ongoing: carried forward from the most recent prior devlog note. SEED ONCE -
+    # only create+fill it when today's note has no Ongoing section yet; if one is
+    # already present, leave it completely untouched so any edits or deletions made
+    # during the day are never clobbered by a later run. Placed beneath Meetings
+    # and Tickets; never touches other sections.
+    $ongoingSection = Find-Section $note '^##\s+Ongoing'
+    if ($null -eq $ongoingSection) {
+        $ongoing = Get-OngoingBody
+        if ($ongoing.Ok) {
             $ongoingSection = @{ Heading = "## Ongoing"; Body = (New-Object System.Collections.ArrayList) }
             Set-OngoingBody $ongoingSection $ongoing.Lines
             $insertAt = $note.Sections.Count
@@ -693,13 +733,14 @@ try {
                 $insertAt = $note.Sections.IndexOf($ms) + 1
             }
             $note.Sections.Insert($insertAt, $ongoingSection)
+            Write-Log "Ongoing seeded ($($ongoing.Lines.Count) line(s))"
         }
         else {
-            Set-OngoingBody $ongoingSection $ongoing.Lines
+            Write-Log "Ongoing skipped (no prior note and ONGOING.md missing/unreadable)"
         }
     }
     else {
-        Write-Log "Ongoing skipped (ONGOING.md missing or unreadable)"
+        Write-Log "Ongoing preserved (already present in today's note)"
     }
 
     # Write the note as UTF-8 WITHOUT a BOM (PS 5.1's Set-Content -Encoding UTF8
